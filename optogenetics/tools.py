@@ -1,3 +1,8 @@
+import numpy as np
+import quantities as pq
+import neo
+
+
 def make_spiketrain_trials(spike_train, epoch, t_start=None, t_stop=None,
                            dim=None):
     '''
