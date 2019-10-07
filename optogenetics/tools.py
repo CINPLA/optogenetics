@@ -69,14 +69,24 @@ def make_spiketrain_trials(spike_train, epoch, t_start=None, t_stop=None,
     if not isinstance(epoch, neo.Epoch):
         raise TypeError('Expected "neo.Epoch" got "' + str(type(epoch)) + '"')
 
+    stim_times = epoch.times.rescale(dim)
+
+
+    # stim_win = np.insert(
+    #     stim_times + t_start,
+    #     np.arange(len(stim_times)) + 1,
+    #     stim_times + t_stop)
+    # src_y = np.searchsorted(sptr, stim_win, side='left')
+    # assert len(src_y) % 2 == 0
+    # idxs = src_y.reshape((int(len(src_y) / 2), 2))
+    # trials = []
+
     trials = []
-    for j, t in enumerate(epoch.times.rescale(dim)):
+    for j, t in enumerate(stim_times):
         t_start = t_starts[j].rescale(dim)
         t_stop = t_stops[j].rescale(dim)
-        spikes = []
-        for spike in sptr[(t+t_start < sptr) & (sptr < t+t_stop)]:
-            spikes.append(spike-t)
-        trials.append(SpikeTrain(times=spikes * unit,
-                                 t_start=t_start,
-                                 t_stop=t_stop))
+        trials.append(SpikeTrain(
+            times=sptr[(t+t_start < sptr) & (sptr < t+t_stop)] - t,
+            t_start=t_start,
+            t_stop=t_stop))
     return trials

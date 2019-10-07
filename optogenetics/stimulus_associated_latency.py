@@ -1,26 +1,137 @@
 import numpy as np
 import neo
+from .tools import make_spiketrain_trials
+import quantities as pq
+from elephant.spike_train_surrogates import dither_spikes
 
 
-def baysian_latency(count_data):
-    import pymc3 as pm
-    import theano.tensor as tt
-    n_count_data = len(count_data)
-    with pm.Model() as model:
-        alpha = 1.0/count_data.mean()  # Recall count_data is the
-                                       # variable that holds our txt counts
-        lambda_1 = pm.Exponential("lambda_1", alpha)
-        lambda_2 = pm.Exponential("lambda_2", alpha)
+def get_limit(spike_times, t_start, t_stop):
+    if t_start is None:
+        try:
+            t_start = float(spike_times.t_start)
+        except AttributeError:
+            t_start = 0
 
-        tau = pm.DiscreteUniform("tau", lower=0, upper=n_count_data - 1)
+    if t_stop is None:
+        try:
+            t_stop = float(spike_times.t_stop)
+        except AttributeError:
+            t_stop = max(spike_times)
 
-    with model:
-        idx = np.arange(n_count_data) # Index
-        lambda_ = pm.math.switch(tau >= idx, lambda_1, lambda_2)
-        observation = pm.Poisson("obs", lambda_, observed=count_data)
-        step = pm.Metropolis()
-        trace = pm.sample(10000, tune=5000,step=step)
-    return trace
+    return t_start, t_stop
+
+
+def histogram(val, bins, density=False):
+    '''Fast histogram
+    Assuming:
+        val, bins are sorted
+        bins increase monotonically and uniformly
+        all(bins[0] <= v <= bins[-1] for v in val)
+    '''
+    result = np.zeros(len(bins) - 1).astype(int)
+    search = np.searchsorted(bins, val, side='right')
+    cnt = np.bincount(search)[1:len(result)+1]
+    result[:len(cnt)] = cnt
+    if density:
+        db = np.array(np.diff(bins), float)
+        return result / db / result.sum(), bins
+    return result, bins
+
+
+def stimulus_response_latency_shuffle(spike_times, stim_times, window, binsize, t_start=None, t_stop=None, n_shuffle=1000, plot=False):
+    t_start, t_stop = get_limit(spike_times, t_start, t_stop)
+    null_trains = dither_spikes(spike_times, window * pq.s, n_shuffle)
+    spike_times = np.array(spike_times)
+    stim_times = np.array(stim_times)
+    n_spikes, n_stim = len(spike_times), len(stim_times)
+    bins = np.arange(0, window + binsize, binsize)
+    idxs = np.searchsorted(spike_times, stim_times, side='right')
+    true_hist, _, = histogram(spike_times[idxs] - stim_times, bins=bins, density=True)
+    null_hists = []
+    for null_spikes in null_trains:
+        null_spikes = np.array(null_spikes)
+        idxs = np.searchsorted(null_spikes, stim_times, side='right')
+        hist, _ = histogram(null_spikes[idxs] - stim_times, bins=bins, density=True)
+        null_hists.append(hist)
+    null_hists = np.array(null_hists)
+    p_excited, p_inhibited = [], []
+    for true, col in zip(true_hist, null_hists.T):
+        p_excited.append(sum(col > true) / n_shuffle)
+        p_inhibited.append(sum(col < true) / n_shuffle)
+    if plot:
+        import matplotlib.pyplot as plt
+        percentile = 99
+        plt.step(bins[1:], true_hist)
+        plt.step(bins[1:], np.percentile(null_hists, 100-percentile, 0))
+        plt.step(bins[1:], np.percentile(null_hists, percentile, 0))
+        plt.step(bins[1:], np.percentile(null_hists, 50, 0))
+    return bins[1:] - binsize, true_hist, np.array(p_excited), np.array(p_inhibited)
+
+def stimulus_response_latency_shuffle_kde(spike_times, stim_times, window, dither=30e-3, std=0.01, n_shuffle=100, plot=False):
+    from scipy.stats import gaussian_kde
+    null_trains = dither_spikes(spike_times, dither * pq.s, n_shuffle)
+    spike_times = np.array(spike_times)
+    stim_times = np.array(stim_times)
+    n_spikes, n_stim = len(spike_times), len(stim_times)
+    times = np.arange(-2e-3, window + 1e-4, 1e-4)
+    idxs = np.searchsorted(spike_times, stim_times, side='right')
+    spikes = np.sort(np.concatenate([spike_times[idxs] - stim_times, spike_times[idxs-1] - stim_times]))
+    # spikes = spike_times[idxs] - stim_times
+    spikes = spikes[(spikes > times.min()) & (spikes < times.max())]
+    true_hist = gaussian_kde(spikes, std)(times)
+    null_hists = []
+    for null_spikes in null_trains:
+        null_spikes = np.array(null_spikes)
+        idxs = np.searchsorted(null_spikes, stim_times, side='right')
+        spikes = np.sort(np.concatenate([null_spikes[idxs] - stim_times, null_spikes[idxs-1] - stim_times]))
+        # spikes = null_spikes[idxs] - stim_times
+        spikes = spikes[(spikes > times.min()) & (spikes < times.max())]
+        hist = gaussian_kde(spikes, std)(times)
+        null_hists.append(hist)
+    null_hists = np.array(null_hists)
+    p_excited, p_inhibited = [], []
+    for true, col in zip(true_hist, null_hists.T):
+        p_excited.append(sum(col > true) / n_shuffle)
+        p_inhibited.append(sum(col < true) / n_shuffle)
+    mask = times >= 0
+    times = times[mask]
+    true_hist = true_hist[mask]
+    p_excited = np.array(p_excited)[mask]
+    p_inhibited = np.array(p_inhibited)[mask]
+
+    if plot:
+        import matplotlib.pyplot as plt
+        percentile = 99
+        plt.plot(times, true_hist)
+        plt.plot(times, np.percentile(null_hists, 100-percentile, 0)[mask])
+        plt.plot(times, np.percentile(null_hists, percentile, 0)[mask])
+        plt.plot(times, np.percentile(null_hists, 50, 0)[mask])
+    return times, true_hist, p_excited, p_inhibited
+
+
+def stimulus_response_latency(spike_times, stim_times, window, std, percentile=99, plot=False):
+    from scipy.stats import gaussian_kde
+    spike_times = np.array(spike_times)
+    stim_times = np.array(stim_times)
+    n_spikes, n_stim = len(spike_times), len(stim_times)
+    times = np.arange(0, window, 1e-4)
+    trials = [spike_times[(spike_times >= t - window) & (spike_times <= t + window)] - t
+              for t in stim_times]
+    spikes = [s for t in trials for s in t]
+    kernel = gaussian_kde(spikes, std)
+
+    # we start 10 % away from -window due to edge effects
+    pre_times = np.arange(- window + window * 0.1, 0, 1e-4)
+    i_percentile = np.percentile(kernel(pre_times), 100 - percentile, 0)
+    e_percentile = np.percentile(kernel(pre_times), percentile, 0)
+    if plot:
+        import matplotlib.pyplot as plt
+        all_times = np.arange(-window, window, 1e-4)
+        plt.plot(all_times, kernel(all_times))
+        plt.plot(pre_times, kernel(pre_times))
+        plt.plot(times, [i_percentile] * len(times))
+        plt.plot(times, [e_percentile] * len(times))
+    return times, kernel, e_percentile, i_percentile
 
 
 def generate_salt_trials(spike_train, epoch):
@@ -44,7 +155,6 @@ def generate_salt_trials(spike_train, epoch):
     out : tuple
         (baseline_trials, test_trials)
     """
-    from exana.stimulus import make_spiketrain_trials
     e = epoch
     test_trials = make_spiketrain_trials(spike_train=spike_train,
                                          epoch=e)
@@ -125,10 +235,11 @@ def salt(baseline_trials, test_trials, winsize, latency_step,
     for i in range(nwins - 1):   # loop through baseline windows
         min_spike_times = []
         for j, trial in enumerate(baseline_trials):   # loop through trials
+            trial = np.array(trial)
             mask = (trial < windows[i + 1]) & (trial > windows[i])
             spikes_in_win = trial[mask]
             if len(spikes_in_win) > 0:
-                min_spike_times.append(spikes_in_win.min().magnitude - windows[i])   # latency from window
+                min_spike_times.append(spikes_in_win.min() - windows[i])   # latency from window
             else:
                 min_spike_times.append(- binsize / 2)   # 0 if no spike in the window
         hlsi[:, i], _ = np.histogram(min_spike_times, bins)   # latency histogram
@@ -138,14 +249,15 @@ def salt(baseline_trials, test_trials, winsize, latency_step,
     p_values = []
     I_values = []
     nttrials = len(test_trials)   # number of trials
-    lsi_tt = np.zeros((nttrials,1))*np.nan   # preallocate latency matrix
+    lsi_tt = np.zeros((nttrials,1)) * np.nan   # preallocate latency matrix
     for latency in latencies:
         min_spike_times = []
         for j, trial in enumerate(test_trials):   # loop through trials
-            mask = (trial < latency + winsize.magnitude) & (trial > latency)
+            trial = np.array(trial)
+            mask = (trial < latency + winsize) & (trial > latency)
             spikes_in_win = trial[mask]
             if len(spikes_in_win) > 0:
-                min_spike_times.append(spikes_in_win.min().magnitude - latency)   # latency from window
+                min_spike_times.append(spikes_in_win.min() - latency)   # latency from window
             else:
                 min_spike_times.append(- binsize / 2)   # 0 if no spike in the window
         hlsi[:, nwins - 1], _ = np.histogram(min_spike_times, bins)   # latency histogram
@@ -163,7 +275,7 @@ def salt(baseline_trials, test_trials, winsize, latency_step,
         p, I = makep(jsd, kn)
         p_values.append(p)
         I_values.append(I)
-    return latencies * pq.s, p_values, I_values
+    return latencies, np.array(p_values), np.array(I_values)
 
 
 def makep(kld, kn):
